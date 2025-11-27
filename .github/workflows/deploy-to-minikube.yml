@@ -9,77 +9,97 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-22.04
     env:
+      IMAGE_NAME: devopshint/node-app
+      # IMAGE_TAG will be set from commit sha to make image unique per run
       IMAGE_TAG: git-${{ github.sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      
-      - name: Cache Minikube kicbase image
-        uses: actions/cache@v4
-        with:
-          path: /tmp/minikube-cache
-          key: minikube-kicbase-v1.33.1-${{ hashFiles('**/k8s-minikube/kicbase/**') }}
-          restore-keys: |
-            minikube-kicbase-v1.33.1-
+      - name: Set up QEMU (for multi-arch, optional)
+        uses: docker/setup-qemu-action@v3
 
-     
+      - name: Set up Docker Buildx (optional, keeps builds consistent)
+        uses: docker/setup-buildx-action@v3
+
       - name: Start Minikube
-        uses: ifeelgoods/minikube-action@v1.3.0
+        id: minikube
+        # pin the setup-minikube action to a released version
+        uses: medyagh/setup-minikube@v0.0.20
         with:
           kubernetes-version: v1.30.0
+          minikube-version: v1.33.1
           driver: docker
-          container-runtime: docker
-          cache-images: true         
-          cache-path: /tmp/minikube-cache
+          # optionally enable addons like ingress, registry
+          addons: |
+            registry
+            ingress
 
-      
-      - name: Minikube status
+      - name: Show minikube & kubectl version
         run: |
+          minikube version
+          kubectl version --client --short
           minikube status
-          kubectl cluster-info
 
-     
       - name: Build Docker image
         run: |
-          docker build -t devopshint/node-app:${{ env.IMAGE_TAG }} .
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
 
       - name: Load image into Minikube
         run: |
-          minikube image load devopshint/node-app:${{ env.IMAGE_TAG }}
+          minikube image load ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
 
-      - name: Render & deploy manifest
+      - name: Deploy to Minikube
         run: |
-          sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml > rendered.yaml
-          kubectl apply -f rendered.yaml
+          # substitute IMAGE tag placeholder in manifest if present and apply
+          if grep -q "\${IMAGE_TAG}" k8s-node-app.yaml; then
+            sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml > rendered-k8s.yaml
+            kubectl apply -f rendered-k8s.yaml
+          else
+            # replace image with the built tag (safe fallback)
+            kubectl set image -f k8s-node-app.yaml '*/nodejs-app'=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --local -o yaml | kubectl apply -f -
+          fi
           kubectl rollout status deployment/nodejs-app --timeout=180s
 
-      - name: Wait for ready pods
+      - name: Wait for pods to be ready
         run: kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s
 
       - name: Get service URL
-        id: url
+        id: service_url
         run: |
-          URL=$(minikube service nodejs-app --url=true | head -1)
+          # Try to get a URL using minikube service; may return multiple lines — take first
+          URL=$(minikube service nodejs-app --url --namespace=default | head -n1 || true)
           echo "url=$URL" >> $GITHUB_OUTPUT
 
-      - name: Health check
+      - name: Health check (HTTP)
         run: |
+          if [ -z "${{ steps.service_url.outputs.url }}" ]; then
+            echo "No service URL returned by minikube. Dumping resources for debug."
+            kubectl get all -l app=nodejs-app -o wide
+            kubectl describe pod -l app=nodejs-app
+            kubectl logs -l app=nodejs-app --tail=200 || true
+            exit 1
+          fi
+
+          echo "Checking ${ { steps.service_url.outputs.url } }"
           for i in {1..20}; do
-            if curl -fsL "${{ steps.url.outputs.url }}" | grep -q "Hello World"; then
-              echo "App is working!"
+            if curl -fsS "${{ steps.service_url.outputs.url }}" | grep -q "Hello World"; then
+              echo "App responded"
               exit 0
             fi
             sleep 3
           done
-          echo "App failed to start"
+          echo "App did not respond after retries"
+          kubectl get pods -l app=nodejs-app -o wide
+          kubectl describe pod -l app=nodejs-app
+          kubectl logs -l app=nodejs-app --tail=200 || true
           exit 1
 
       - name: Debug on failure
         if: failure()
         run: |
           minikube status
-          kubectl get all -l app=nodejs-app
+          kubectl get all -l app=nodejs-app -o wide
           kubectl describe pod -l app=nodejs-app
-          kubectl logs -l app=nodejs-app --tail=100
+          kubectl logs -l app=nodejs-app --tail=200 || true
