@@ -24,27 +24,30 @@ jobs:
 
       - name: Deploy to cluster
         run: |
-          
           kubectl apply -f k8s-node-app.yaml
-         
           kubectl set image deployment/nodejs-app nodejs-app=devopshint/node-app:git-${{ github.sha }}
           kubectl rollout status deployment/nodejs-app --timeout=120s
 
-      - name: Verify application
+      - name: Verify application 
         id: verify
         run: |
-          URL=$(minikube service nodejs-app --url --format='{{.}}' | head -1)
+          IP=$(minikube ip)
+          URL="http://${IP}:30001"
+          echo "Attempting to access application at URL: $URL"
+
           for i in {1..30}; do
-            if curl -s "$URL" | grep -q "Hello World"; then
+           
+            if curl -s -m 5 "$URL" | grep -q "Hello World"; then
               echo "Application is up and running!"
               exit 0
             fi
-            echo "Waiting for app... ($i/30)"
+            echo "Waiting for app... ($i/30). NodePort URL: $URL"
             sleep 5
           done
           echo "Application did not respond correctly"
           exit 1
       
+     
       - name: Debug Deployment Status 
         if: always() && steps.verify.outcome == 'failure'
         run: |
@@ -61,4 +64,4 @@ jobs:
           fi
           echo "--- Service Status (nodejs-app) ---"
           kubectl describe service nodejs-app
-          exit 1 
+          exit 1
