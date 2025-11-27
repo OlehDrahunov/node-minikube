@@ -10,37 +10,42 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       IMAGE_NAME: devopshint/node-app
-      # IMAGE_TAG will be set from commit sha to make image unique per run
       IMAGE_TAG: git-${{ github.sha }}
+      MINIKUBE_PROFILE: minikube
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (for multi-arch, optional)
+      - name: Set up QEMU (optional, for multi-arch)
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx (optional, keeps builds consistent)
+      - name: Set up Docker Buildx (optional)
         uses: docker/setup-buildx-action@v3
 
-      - name: Start Minikube
-        id: minikube
-        # pin the setup-minikube action to a released version
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: '1.30.0'
+
+      - name: Install minikube (CLI)
         uses: medyagh/setup-minikube@v0.0.20
         with:
-          kubernetes-version: v1.30.0
-          minikube-version: v1.33.1
-          driver: docker
-          # optionally enable addons like ingress, registry
-          addons: |
-            registry
-            ingress
+          minikube-version: '1.33.1'
+          kubernetes-version: 'v1.30.0'
+        
 
-      - name: Show minikube & kubectl version
+      - name: Start Minikube (creates profile)
+        run: |
+          minikube start --driver=docker --profile=${{ env.MINIKUBE_PROFILE }} --kubernetes-version=v1.30.0 --wait=all --v=1
+          minikube profile list || true
+          minikube status --profile=${{ env.MINIKUBE_PROFILE }} || true
+          kubectl cluster-info || true
+
+      - name: Show versions
         run: |
           minikube version
           kubectl version --client --short
-          minikube status
 
       - name: Build Docker image
         run: |
@@ -48,58 +53,64 @@ jobs:
 
       - name: Load image into Minikube
         run: |
-          minikube image load ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          minikube image load ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --profile=${{ env.MINIKUBE_PROFILE }}
 
-      - name: Deploy to Minikube
+      - name: Deploy manifest to Minikube
         run: |
-          # substitute IMAGE tag placeholder in manifest if present and apply
           if grep -q "\${IMAGE_TAG}" k8s-node-app.yaml; then
             sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml > rendered-k8s.yaml
             kubectl apply -f rendered-k8s.yaml
           else
-            # replace image with the built tag (safe fallback)
-            kubectl set image -f k8s-node-app.yaml '*/nodejs-app'=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --local -o yaml | kubectl apply -f -
+            kubectl apply -f k8s-node-app.yaml --record || true
+            kubectl set image deployment/nodejs-app nodejs-app=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --namespace=default || true
           fi
-          kubectl rollout status deployment/nodejs-app --timeout=180s
+          kubectl rollout status deployment/nodejs-app --namespace=default --timeout=180s
 
-      - name: Wait for pods to be ready
-        run: kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s
+      - name: Wait for pods ready
+        run: |
+          kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s --namespace=default
 
       - name: Get service URL
         id: service_url
         run: |
-          # Try to get a URL using minikube service; may return multiple lines — take first
-          URL=$(minikube service nodejs-app --url --namespace=default | head -n1 || true)
+       
+          URL=$(minikube service nodejs-app --url --namespace=default --profile=${{ env.MINIKUBE_PROFILE }} | head -n1 || true)
           echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Discovered service URL: $URL"
 
       - name: Health check (HTTP)
         run: |
-          if [ -z "${{ steps.service_url.outputs.url }}" ]; then
-            echo "No service URL returned by minikube. Dumping resources for debug."
-            kubectl get all -l app=nodejs-app -o wide
-            kubectl describe pod -l app=nodejs-app
-            kubectl logs -l app=nodejs-app --tail=200 || true
+          SERVICE_URL="${{ steps.service_url.outputs.url }}"
+          if [ -z "$SERVICE_URL" ]; then
+            echo "No service URL from minikube. Dumping resources for debug."
+            kubectl get all -l app=nodejs-app -o wide --namespace=default
+            kubectl describe pod -l app=nodejs-app --namespace=default || true
+            kubectl logs -l app=nodejs-app --namespace=default --tail=200 || true
             exit 1
           fi
 
-          echo "Checking ${ { steps.service_url.outputs.url } }"
-          for i in {1..20}; do
-            if curl -fsS "${{ steps.service_url.outputs.url }}" | grep -q "Hello World"; then
-              echo "App responded"
+          echo "Checking service at $SERVICE_URL (expecting 'Hello World')"
+          for i in $(seq 1 20); do
+            if curl -fsS "$SERVICE_URL" | grep -q "Hello World"; then
+              echo "App responded successfully."
               exit 0
             fi
+            echo "Attempt $i: still waiting..."
             sleep 3
           done
-          echo "App did not respond after retries"
-          kubectl get pods -l app=nodejs-app -o wide
-          kubectl describe pod -l app=nodejs-app
-          kubectl logs -l app=nodejs-app --tail=200 || true
+
+          echo "App did not respond after retries."
+          kubectl get pods -l app=nodejs-app -o wide --namespace=default
+          kubectl describe pod -l app=nodejs-app --namespace=default || true
+          kubectl logs -l app=nodejs-app --namespace=default --tail=200 || true
           exit 1
 
       - name: Debug on failure
         if: failure()
         run: |
-          minikube status
-          kubectl get all -l app=nodejs-app -o wide
-          kubectl describe pod -l app=nodejs-app
-          kubectl logs -l app=nodejs-app --tail=200 || true
+          echo "Minikube and cluster debug info:"
+          minikube profile list || true
+          minikube status --profile=${{ env.MINIKUBE_PROFILE }} || true
+          kubectl get all -l app=nodejs-app -o wide --namespace=default || true
+          kubectl describe pod -l app=nodejs-app --namespace=default || true
+          kubectl logs -l app=nodejs-app --namespace=default --tail=200 || true
