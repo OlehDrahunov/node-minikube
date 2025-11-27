@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Minikube
-        uses: medyagh/setup-minikube@v1 
+        uses: medyagh/setup-minikube@v0.0.12 
 
       - name: Build and load image
         run: |
@@ -21,9 +21,7 @@ jobs:
 
       - name: Deploy to cluster
         run: |
-          
           kubectl apply -f k8s-node-app.yaml
-          
           kubectl set image deployment/nodejs-app nodejs-app=devopshint/node-app:git-${{ github.sha }}
           kubectl rollout status deployment/nodejs-app --timeout=120s
 
