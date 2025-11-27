@@ -3,80 +3,40 @@ name: Deploy to Minikube
 on:
   push:
     branches: [ master ]
-  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-22.04
 
-    env:
-      IMAGE_NAME: devopshint/node-app
-      IMAGE_TAG: git-${{ github.sha }}
-      MINIKUBE_PROFILE: minikube
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install kubectl (works every time)
+      - name: Setup Minikube
+        uses: medyagh/setup-minikube@v1 
+
+      - name: Build and load image
         run: |
-          sudo apt-get update
-          sudo apt-get install -y kubectl
+          docker build -t devopshint/node-app:git-${{ github.sha }} .
+          minikube image load devopshint/node-app:git-${{ github.sha }}
 
-      - name: Install Minikube
-        uses: medyagh/setup-minikube@v0.0.20
-        with:
-          minikube-version: '1.33.1'
-          kubernetes-version: 'v1.30.0'
-
-      - name: Start Minikube
+      - name: Deploy to cluster
         run: |
-          minikube start \
-            --driver=docker \
-            --profile=${{ env.MINIKUBE_PROFILE }} \
-            --kubernetes-version=v1.30.0 \
-            --wait=all
+          
+          kubectl apply -f k8s-node-app.yaml
+          
+          kubectl set image deployment/nodejs-app nodejs-app=devopshint/node-app:git-${{ github.sha }}
+          kubectl rollout status deployment/nodejs-app --timeout=120s
 
-          minikube status --profile=${{ env.MINIKUBE_PROFILE }}
-
-      - name: Build Docker image
+      - name: Verify application
         run: |
-          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
-
-      - name: Load image into Minikube
-        run: |
-          minikube image load ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --profile=${{ env.MINIKUBE_PROFILE }}
-
-      - name: Deploy to Kubernetes
-        run: |
-          sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml > rendered.yaml
-          kubectl apply -f rendered.yaml
-          kubectl rollout status deployment/nodejs-app --timeout=180s
-
-      - name: Wait for pods
-        run: |
-          kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s
-
-      - name: Get service URL
-        id: svc
-        run: |
-          URL=$(minikube service nodejs-app --url --profile=${{ env.MINIKUBE_PROFILE }} | head -n1)
-          echo "url=$URL" >> $GITHUB_OUTPUT
-
-      - name: Health check
-        run: |
-          URL="${{ steps.svc.outputs.url }}"
-          echo "Checking: $URL"
-
-          for i in {1..20}; do
-            if curl -fs $URL | grep -q "Hello World"; then
-              echo "App OK"
+          URL=$(minikube service nodejs-app --url --format='{{.}}' | head -1)
+          for i in {1..30}; do
+            if curl -s "$URL" | grep -q "Hello World"; then
+              echo "Application is up and running!"
               exit 0
             fi
-            sleep 3
+            echo "Waiting for app... ($i/30)"
+            sleep 5
           done
-
-          echo "App failed to start"
-          kubectl get pods -l app=nodejs-app -o wide
-          kubectl logs -l app=nodejs-app
+          echo "Application did not respond correctly"
           exit 1
