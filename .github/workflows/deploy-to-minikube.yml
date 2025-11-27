@@ -11,8 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate package-lock.json 
+        run: npm install --package-lock-only 
+
       - name: Setup Minikube
-        uses: medyagh/setup-minikube@v0.0.12 
+        uses: medyagh/setup-minikube@v0.0.12
 
       - name: Build and load image
         run: |
