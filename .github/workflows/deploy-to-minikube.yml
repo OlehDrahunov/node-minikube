@@ -2,13 +2,12 @@ name: Deploy to Minikube
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-22.04
-     
     env:
       IMAGE_TAG: git-${{ github.sha }}
 
@@ -16,86 +15,71 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Minikube
-        uses: medyagh/setup-minikube@v0.0.18
+      
+      - name: Cache Minikube kicbase image
+        uses: actions/cache@v4
         with:
-          minikube-version: 1.33.1
+          path: /tmp/minikube-cache
+          key: minikube-kicbase-v1.33.1-${{ hashFiles('**/k8s-minikube/kicbase/**') }}
+          restore-keys: |
+            minikube-kicbase-v1.33.1-
+
+     
+      - name: Start Minikube
+        uses: ifeelgoods/minikube-action@v1.3.0
+        with:
           kubernetes-version: v1.30.0
           driver: docker
           container-runtime: docker
+          cache-images: true         
+          cache-path: /tmp/minikube-cache
 
-      - name: Verify Minikube
+      
+      - name: Minikube status
         run: |
           minikube status
           kubectl cluster-info
 
+     
       - name: Build Docker image
         run: |
-          echo "Building devopshint/node-app:${{ env.IMAGE_TAG }}"
           docker build -t devopshint/node-app:${{ env.IMAGE_TAG }} .
 
       - name: Load image into Minikube
         run: |
-          echo "Loading image into Minikube..."
           minikube image load devopshint/node-app:${{ env.IMAGE_TAG }}
 
-      - name: Render Kubernetes manifest
+      - name: Render & deploy manifest
         run: |
-          sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml \
-            > k8s-node-app-deploy.yaml
-          echo "=== Generated manifest ==="
-          cat k8s-node-app-deploy.yaml
-
-      - name: Deploy to Minikube
-        run: |
-          kubectl apply -f k8s-node-app-deploy.yaml
+          sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml > rendered.yaml
+          kubectl apply -f rendered.yaml
           kubectl rollout status deployment/nodejs-app --timeout=180s
 
-      - name: Wait for pods ready
-        run: |
-          kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s
+      - name: Wait for ready pods
+        run: kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s
 
       - name: Get service URL
         id: url
         run: |
           URL=$(minikube service nodejs-app --url=true | head -1)
-          echo "Service accessible at: $URL"
           echo "url=$URL" >> $GITHUB_OUTPUT
 
       - name: Health check
         run: |
-          for i in {1..30}; do
-            if curl -f --silent --max-time 10 "${{ steps.url.outputs.url }}" | grep -q "Hello World"; then
-              echo "Application is up and running!"
-              curl -s "${{ steps.url.outputs.url }}"
+          for i in {1..20}; do
+            if curl -fsL "${{ steps.url.outputs.url }}" | grep -q "Hello World"; then
+              echo "App is working!"
               exit 0
             fi
-            echo "Waiting for app... ($i/30)"
-            sleep 5
+            sleep 3
           done
-          echo "Application failed to start"
+          echo "App failed to start"
           exit 1
-
-      - name: Smoke tests
-        run: |
-          URL="${{ steps.url.outputs.url }}"
-
-          echo "=== Smoke tests ==="
-          code=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-          [ "$code" -eq 200 ] && echo "HTTP 200 OK" || (echo "HTTP $code"; exit 1)
-
-          curl -s "$URL" | grep -q "Hello World" && echo "Content OK" || (echo "Wrong content"; exit 1)
-
-          echo "All tests passed!"
 
       - name: Debug on failure
         if: failure()
         run: |
-          echo "=== DEBUG INFO (failure) ==="
           minikube status
-          kubectl get nodes
-          kubectl get pods -l app=nodejs-app -o wide
-          kubectl describe pods -l app=nodejs-app
-          kubectl logs -l app=nodejs-app --tail=200
-          kubectl get events --sort-by='.lastTimestamp' | tail -30
-          minikube image ls | grep node-app || true
+          kubectl get all -l app=nodejs-app
+          kubectl describe pod -l app=nodejs-app
+          kubectl logs -l app=nodejs-app --tail=100
