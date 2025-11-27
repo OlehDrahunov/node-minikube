@@ -11,11 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate package-lock.json 
+      - name: Generate package-lock.json
         run: npm install --package-lock-only 
 
       - name: Setup Minikube
-        uses: medyagh/setup-minikube@v0.0.12
+        uses: medyagh/setup-minikube@v0.0.12 
 
       - name: Build and load image
         run: |
@@ -24,11 +24,14 @@ jobs:
 
       - name: Deploy to cluster
         run: |
+          
           kubectl apply -f k8s-node-app.yaml
+         
           kubectl set image deployment/nodejs-app nodejs-app=devopshint/node-app:git-${{ github.sha }}
           kubectl rollout status deployment/nodejs-app --timeout=120s
 
       - name: Verify application
+        id: verify
         run: |
           URL=$(minikube service nodejs-app --url --format='{{.}}' | head -1)
           for i in {1..30}; do
@@ -41,3 +44,21 @@ jobs:
           done
           echo "Application did not respond correctly"
           exit 1
+      
+      - name: Debug Deployment Status 
+        if: always() && steps.verify.outcome == 'failure'
+        run: |
+          echo "--- Deployment Status (nodejs-app) ---"
+          kubectl describe deployment nodejs-app
+          echo "--- Pod Status ---"
+          kubectl get pods
+          echo "--- Pod Logs ---"
+          POD_NAME=$(kubectl get pods -l app=nodejs-app -o jsonpath='{.items[0].metadata.name}' || true)
+          if [ -n "$POD_NAME" ]; then
+            kubectl logs $POD_NAME
+          else
+            echo "No pod found to get logs."
+          fi
+          echo "--- Service Status (nodejs-app) ---"
+          kubectl describe service nodejs-app
+          exit 1 
