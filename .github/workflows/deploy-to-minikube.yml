@@ -3,10 +3,14 @@ name: Deploy to Minikube
 on:
   push:
     branches: [ master ]
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-22.04
+     
+    env:
+      IMAGE_TAG: git-${{ github.sha }}
 
     steps:
       - name: Checkout code
@@ -17,149 +21,81 @@ jobs:
         with:
           minikube-version: 1.33.1
           kubernetes-version: v1.30.0
-        continue-on-error: false
+          driver: docker
+          container-runtime: docker
 
-      - name: Verify Minikube is running
+      - name: Verify Minikube
         run: |
           minikube status
           kubectl cluster-info
-          kubectl get nodes
 
       - name: Build Docker image
         run: |
-          export IMAGE_TAG="git-${{ github.sha }}"
-          echo "Building image: devopshint/node-app:${IMAGE_TAG}"
-          docker build -t devopshint/node-app:${IMAGE_TAG} .
-          docker images | grep node-app
+          echo "Building devopshint/node-app:${{ env.IMAGE_TAG }}"
+          docker build -t devopshint/node-app:${{ env.IMAGE_TAG }} .
 
-      - name: Load image to Minikube
+      - name: Load image into Minikube
         run: |
-          export IMAGE_TAG="git-${{ github.sha }}"
-          echo "Loading image to Minikube..."
-          minikube image load devopshint/node-app:${IMAGE_TAG}
-          minikube image ls | grep node-app || echo "Image not found in minikube cache"
+          echo "Loading image into Minikube..."
+          minikube image load devopshint/node-app:${{ env.IMAGE_TAG }}
 
-      - name: Prepare Kubernetes manifest
+      - name: Render Kubernetes manifest
         run: |
-          export IMAGE_TAG="git-${{ github.sha }}"
-          echo "Image tag: ${IMAGE_TAG}"
-          envsubst < k8s-node-app.yaml > k8s-node-app-deploy.yaml
+          sed "s|\${IMAGE_TAG}|${{ env.IMAGE_TAG }}|g" k8s-node-app.yaml \
+            > k8s-node-app-deploy.yaml
+          echo "=== Generated manifest ==="
           cat k8s-node-app-deploy.yaml
 
-      - name: Deploy to cluster
+      - name: Deploy to Minikube
         run: |
           kubectl apply -f k8s-node-app-deploy.yaml
-          echo "Waiting for deployment to complete..."
-          kubectl rollout status deployment/nodejs-app --timeout=120s
+          kubectl rollout status deployment/nodejs-app --timeout=180s
 
-      - name: Check deployment status
+      - name: Wait for pods ready
         run: |
-          echo "=== Deployments ==="
-          kubectl get deployments -l app=nodejs-app
-          echo ""
-          echo "=== Pods ==="
-          kubectl get pods -l app=nodejs-app
-          echo ""
-          echo "=== Services ==="
-          kubectl get svc nodejs-app
+          kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=180s
 
-      - name: Wait for pods to be ready
+      - name: Get service URL
+        id: url
         run: |
-          echo "Waiting for pods to be ready..."
-          kubectl wait --for=condition=ready pod -l app=nodejs-app --timeout=120s
+          URL=$(minikube service nodejs-app --url=true | head -1)
+          echo "Service accessible at: $URL"
+          echo "url=$URL" >> $GITHUB_OUTPUT
 
-      - name: Verify application
+      - name: Health check
         run: |
-          echo "Getting service URL..."
-          URL=$(minikube service nodejs-app --url | head -1)
-          echo "Testing application at: $URL"
-          
-          SUCCESS=false
           for i in {1..30}; do
-            if curl -s --fail --max-time 5 "$URL" | grep -q "Hello World"; then
-              echo "✓ Application is up and running!"
-              echo "Response:"
-              curl -s "$URL"
-              SUCCESS=true
-              break
+            if curl -f --silent --max-time 10 "${{ steps.url.outputs.url }}" | grep -q "Hello World"; then
+              echo "Application is up and running!"
+              curl -s "${{ steps.url.outputs.url }}"
+              exit 0
             fi
-            echo " Waiting for app... ($i/30)"
+            echo "Waiting for app... ($i/30)"
             sleep 5
           done
-          
-          if [ "$SUCCESS" = false ]; then
-            echo "✗ Application did not respond correctly"
-            exit 1
-          fi
+          echo "Application failed to start"
+          exit 1
 
-      - name: Run smoke tests
+      - name: Smoke tests
         run: |
-          URL=$(minikube service nodejs-app --url | head -1)
-          echo "Running smoke tests..."
-          
-          
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-          if [ "$STATUS" -eq 200 ]; then
-            echo "✓ HTTP status: $STATUS"
-          else
-            echo "✗ HTTP status: $STATUS (expected 200)"
-            exit 1
-          fi
-          
-          
-          RESPONSE=$(curl -s "$URL")
-          if echo "$RESPONSE" | grep -q "Hello World"; then
-            echo "✓ Response content: OK"
-          else
-            echo "✗ Response content: FAIL"
-            exit 1
-          fi
-          
-          
-          kubectl get endpoints nodejs-app
-          
-          echo "✓ All smoke tests passed!"
+          URL="${{ steps.url.outputs.url }}"
+
+          echo "=== Smoke tests ==="
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+          [ "$code" -eq 200 ] && echo "HTTP 200 OK" || (echo "HTTP $code"; exit 1)
+
+          curl -s "$URL" | grep -q "Hello World" && echo "Content OK" || (echo "Wrong content"; exit 1)
+
+          echo "All tests passed!"
 
       - name: Debug on failure
         if: failure()
         run: |
-          echo "======================================"
-          echo "DEPLOYMENT DEBUGGING INFORMATION"
-          echo "======================================"
-          
-          echo ""
-          echo "=== Deployment Status ==="
-          kubectl get deployments -o wide
-          
-          echo ""
-          echo "=== Pod Status ==="
-          kubectl get pods -l app=nodejs-app -o wide
-          
-          echo ""
-          echo "=== Pod Descriptions ==="
-          kubectl describe pods -l app=nodejs-app
-          
-          echo ""
-          echo "=== Pod Logs ==="
-          for pod in $(kubectl get pods -l app=nodejs-app -o name); do
-            echo "Logs from $pod:"
-            kubectl logs $pod --tail=100 || echo "Failed to get logs from $pod"
-            echo "---"
-          done
-          
-          echo ""
-          echo "=== Service Status ==="
-          kubectl get svc nodejs-app -o wide
-          kubectl describe svc nodejs-app
-          
-          echo ""
-          echo "=== Recent Events ==="
-          kubectl get events --sort-by='.lastTimestamp' | tail -30
-          
-          echo ""
-          echo "=== Minikube Status ==="
+          echo "=== DEBUG INFO (failure) ==="
           minikube status
-          
-          echo ""
-          echo "=== Docker Images in Minikube ==="
-          minikube image ls | grep node-app || echo "No node-app images found"
+          kubectl get nodes
+          kubectl get pods -l app=nodejs-app -o wide
+          kubectl describe pods -l app=nodejs-app
+          kubectl logs -l app=nodejs-app --tail=200
+          kubectl get events --sort-by='.lastTimestamp' | tail -30
+          minikube image ls | grep node-app || true
